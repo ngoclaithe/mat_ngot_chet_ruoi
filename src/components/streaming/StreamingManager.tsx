@@ -85,12 +85,16 @@ export function StreamingManager({
 
       console.log('🔌 Socket Config:', socketConfig)
 
+      // Setup listeners BEFORE connecting
       setupSocketEventListeners()
+
       console.log('🔌 Connecting to socket...')
       await socketService.connect(socketConfig)
 
-      console.log('✅ Socket connected successfully')
-      setIsConnected(true)
+      // Use socket service's connection state instead of setting our own
+      const connected = socketService.getIsConnected()
+      console.log('✅ Socket connected successfully, connected state:', connected)
+      setIsConnected(connected)
 
       console.log('📡 Starting streaming session...')
       socketService.startStreaming(streamData.id, streamData.streamKey)
@@ -122,26 +126,44 @@ export function StreamingManager({
   const setupSocketEventListeners = () => {
     socketService.on('connect', () => {
       console.log('Socket connected via service')
-      setIsConnected(true)
+      const connected = socketService.getIsConnected()
+      console.log('Setting connected state to:', connected)
+      setIsConnected(connected)
 
       // Clear reconnect timeout on successful connection
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current)
         reconnectTimeoutRef.current = null
       }
+
+      // Start chunk processor if we have chunks waiting and recording
+      if (isRecording && chunkQueueRef.current.length > 0 && !processingRef.current) {
+        console.log('🔄 Restarting chunk processor after connection')
+        startChunkProcessor()
+      }
     })
 
     // Listen for room joined confirmation from backend
     socketService.onRoomJoined((data: any) => {
       console.log('Room joined confirmed by backend:', data)
-      setIsConnected(true)
+      const connected = socketService.getIsConnected()
+      setIsConnected(connected)
+
+      // Start chunk processor if we have chunks waiting and recording
+      if (isRecording && chunkQueueRef.current.length > 0 && !processingRef.current) {
+        console.log('🔄 Starting chunk processor after room joined')
+        startChunkProcessor()
+      }
     })
 
     socketService.on('disconnect', (data: any) => {
       console.log('Socket disconnected:', data.reason)
       setIsConnected(false)
       setIsRecording(false)
-      
+
+      // Stop chunk processor
+      processingRef.current = false
+
       // Auto reconnect unless it's intentional disconnect
       if (data.reason !== 'io client disconnect') {
         scheduleReconnect()
@@ -151,17 +173,25 @@ export function StreamingManager({
     socketService.on('connect_error', (error: any) => {
       console.error('Connection error:', error)
       setIsConnected(false)
+      processingRef.current = false
       scheduleReconnect()
     })
 
     socketService.on('reconnect', () => {
       console.log('Socket reconnected successfully')
-      setIsConnected(true)
+      const connected = socketService.getIsConnected()
+      setIsConnected(connected)
+
       if (streamData) {
         socketService.startStreaming(streamData.id, streamData.streamKey)
         // Resume recording if media stream exists
         if (mediaStream && !isRecording) {
           startOptimizedRecording(mediaStream)
+        }
+        // Restart chunk processor if we have chunks waiting
+        if (chunkQueueRef.current.length > 0 && !processingRef.current) {
+          console.log('🔄 Restarting chunk processor after reconnection')
+          startChunkProcessor()
         }
       }
     })
@@ -310,7 +340,14 @@ export function StreamingManager({
       mediaRecorder.onstart = () => {
         console.log('🔴 Optimized MediaRecorder started')
         setIsRecording(true)
-        startChunkProcessor() // Start processing queued chunks
+
+        // Only start chunk processor if socket is connected
+        if (socketService.getIsConnected()) {
+          console.log('✅ Socket connected, starting chunk processor')
+          startChunkProcessor() // Start processing queued chunks
+        } else {
+          console.log('⚠️ Socket not connected, chunk processor will start when connected')
+        }
       }
 
       mediaRecorder.onstop = () => {
@@ -378,6 +415,12 @@ export function StreamingManager({
     }
 
     console.log(`Chunk #${chunkNumber} queued (${(buffer.byteLength / 1024).toFixed(2)}KB). Queue size: ${chunkQueue.length}`)
+
+    // Auto-start chunk processor if socket is connected and processor not running
+    if (socketService.getIsConnected() && !processingRef.current && isRecording) {
+      console.log('🚀 Auto-starting chunk processor - socket connected and chunks ready')
+      startChunkProcessor()
+    }
   }
 
   const startChunkProcessor = () => {
@@ -393,9 +436,11 @@ export function StreamingManager({
   }
 
   const processChunkQueue = async () => {
-    console.log('🔄 Processing chunk queue. isConnected:', isConnected, 'processingRef.current:', processingRef.current)
+    const socketConnected = socketService.getIsConnected()
+    console.log('🔄 Processing chunk queue. socketConnected:', socketConnected, 'localConnected:', isConnected, 'processingRef.current:', processingRef.current)
 
-    while (processingRef.current && isConnected) {
+    // Use socket service connection state as primary source of truth
+    while (processingRef.current && socketConnected) {
       const chunkQueue = chunkQueueRef.current
 
       console.log(`📊 Queue status: ${chunkQueue.length} chunks waiting`)
@@ -421,11 +466,17 @@ export function StreamingManager({
         }
       }
 
+      // Check connection state again in case it changed during processing
+      if (!socketService.getIsConnected()) {
+        console.log('❌ Socket disconnected during chunk processing, stopping')
+        break
+      }
+
       // Wait before processing next chunk to avoid overwhelming
       await sleep(CHUNK_SEND_INTERVAL)
     }
 
-    console.log('🛑 Chunk processor stopped. isConnected:', isConnected, 'processingRef.current:', processingRef.current)
+    console.log('🛑 Chunk processor stopped. socketConnected:', socketService.getIsConnected(), 'localConnected:', isConnected, 'processingRef.current:', processingRef.current)
   }
 
   const sendChunkWithRetry = async (buffer: ArrayBuffer, chunkNumber: number, retries = 3): Promise<void> => {
